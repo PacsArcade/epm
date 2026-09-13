@@ -6,12 +6,22 @@
  * is the row insert time). It's the user's stated content date.
  *
  * Precedence chain (default order):
- *   1. frontmatter.event_date    — meeting / event pages
- *   2. frontmatter.date          — dated essays
- *   3. frontmatter.published     — writing/
- *   4. filename-date             — leading YYYY-MM-DD in basename
- *   5. updated_at                — fallback
- *   6. created_at                — last resort (only if updated_at NULL)
+ *   1. frontmatter.bft_utc       — house BFT Desk stamp's riding UTC (TASK-199)
+ *   2. frontmatter.event_date    — meeting / event pages
+ *   3. frontmatter.date          — dated essays
+ *   4. frontmatter.published     — writing/
+ *   5. filename-date             — leading YYYY-MM-DD in basename
+ *   6. updated_at                — fallback
+ *   7. created_at                — last resort (only if updated_at NULL)
+ *
+ * `bft_utc` leads because it is a MEASURED time the author deliberately
+ * stamped (the Desk form carries a real UTC wall-clock beside the a₿ date).
+ * It is emitted by frontmatter inference only when a UTC rides the stamp —
+ * a bare `0018.06.18 a₿` stamp NEVER becomes a Gregorian date (no
+ * height → wall-clock conversion, derive-or-dash); those pages keep the
+ * existing chain and gain `block_height` for ordering instead. The usual
+ * range gate [1990-01-01, NOW + 1 year] applies to a stamp-riding UTC the
+ * same as every other candidate.
  *
  * Per-prefix override: for `daily/` and `meetings/` slug prefixes, the
  * filename-date jumps to position 1 — the filename is the user's primary
@@ -121,21 +131,26 @@ export function computeEffectiveDate(opts: ComputeEffectiveDateOpts): EffectiveD
   const { slug, frontmatter, filename, updatedAt, createdAt } = opts;
   const filenameFirst = hasFilenameFirstPrefix(slug);
 
+  const fmBftUtc = validateInRange(parseDateLoose(frontmatter.bft_utc));
   const fmEvent = validateInRange(parseDateLoose(frontmatter.event_date));
   const fmDate = validateInRange(parseDateLoose(frontmatter.date));
   const fmPublished = validateInRange(parseDateLoose(frontmatter.published));
   const filenameDate = extractFilenameDate(filename);
 
   // Build the ordered candidate list. For filename-first prefixes
-  // (daily/, meetings/) the filename moves to the head of the chain.
+  // (daily/, meetings/) the filename moves to the head of the chain —
+  // except bft_utc, which stays first in both shapes: a measured stamp
+  // outranks even the filename convention.
   const candidates: Array<{ date: Date | null; source: EffectiveDateSource }> = filenameFirst
     ? [
+        { date: fmBftUtc, source: 'bft_utc' },
         { date: filenameDate, source: 'filename' },
         { date: fmEvent, source: 'event_date' },
         { date: fmDate, source: 'date' },
         { date: fmPublished, source: 'published' },
       ]
     : [
+        { date: fmBftUtc, source: 'bft_utc' },
         { date: fmEvent, source: 'event_date' },
         { date: fmDate, source: 'date' },
         { date: fmPublished, source: 'published' },

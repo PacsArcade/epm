@@ -251,6 +251,55 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
 }
 
 // ============================================================
+// House fork (TASK-199) — BFT / fleet task-id filters
+// ============================================================
+
+/**
+ * Build the BFT / task-id filter clauses shared by BOTH engines (the
+ * engine-parity law: one builder, no drift). Appends parameterized values
+ * to `params` and returns SQL with a leading ` AND` per clause, spliced
+ * next to the since/until date filters at every search site (keyword,
+ * titles, keyword-chunks, vector, and the shared CJK fallback).
+ *
+ * Predicates read `pages.frontmatter` JSONB — no new columns, no DDL:
+ *   - taskId:     `(p.frontmatter->'task_ids') ? $N` — array-contains on
+ *                 the normalized id; bound as a plain text param (never
+ *                 JSON.stringify into ::jsonb).
+ *   - sinceBlock: `block_height >= $N`, guarded by a `~ '^[0-9]+$'` text
+ *                 check inside a CASE so a hand-authored non-numeric
+ *                 block_height can't make the ::int cast throw. Pages
+ *                 without block_height (NULL) never match — the filter
+ *                 selects stamped pages, it never guesses heights.
+ *   - untilBlock: same shape, `<=`.
+ *
+ * @param pageAlias — page table alias (engine-supplied, e.g. `'p'`)
+ * @param opts      — SearchOpts (only the three house fields are read)
+ * @param params    — the site's positional params array (mutated: push)
+ */
+export function buildBftTaskFilter(
+  pageAlias: string,
+  opts: { taskId?: string; sinceBlock?: number; untilBlock?: number } | undefined,
+  params: unknown[],
+): string {
+  if (!opts) return '';
+  let out = '';
+  const bh = `(${pageAlias}.frontmatter->>'block_height')`;
+  if (opts.taskId) {
+    params.push(opts.taskId);
+    out += ` AND (${pageAlias}.frontmatter->'task_ids') ? $${params.length}`;
+  }
+  if (typeof opts.sinceBlock === 'number' && Number.isFinite(opts.sinceBlock)) {
+    params.push(Math.floor(opts.sinceBlock));
+    out += ` AND CASE WHEN ${bh} ~ '^[0-9]+$' THEN ${bh}::int >= $${params.length} ELSE false END`;
+  }
+  if (typeof opts.untilBlock === 'number' && Number.isFinite(opts.untilBlock)) {
+    params.push(Math.floor(opts.untilBlock));
+    out += ` AND CASE WHEN ${bh} ~ '^[0-9]+$' THEN ${bh}::int <= $${params.length} ELSE false END`;
+  }
+  return out;
+}
+
+// ============================================================
 // websearch_to_tsquery input bounds
 // ============================================================
 

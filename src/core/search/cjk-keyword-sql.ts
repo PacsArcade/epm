@@ -21,7 +21,7 @@
  *   - Empty-query guard returns null without binding SQL.
  */
 import type { SearchOpts } from '../types.ts';
-import { buildBestPerPagePoolCte } from './sql-ranking.ts';
+import { buildBestPerPagePoolCte, buildBftTaskFilter } from './sql-ranking.ts';
 import { escapeLikePattern, splitCJKQueryTerms } from '../cjk.ts';
 
 /** Query-shape context shared by both engines' CJK fallback call sites. */
@@ -124,6 +124,9 @@ export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywor
     params.push(opts.beforeDate);
     extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
   }
+  // House fork (TASK-199): BFT / task-id filters on the CJK fallback too —
+  // same shared builder, so a filtered CJK query can't return out-of-contract rows.
+  extraFilter += buildBftTaskFilter('p', opts, params);
   // v0.34.1 (#861 — P0 leak seal): source-isolation on the CJK fallback path.
   if (opts?.sourceIds && opts.sourceIds.length > 0) {
     params.push(opts.sourceIds);

@@ -59,6 +59,7 @@
  */
 
 import { basename, dirname, relative } from 'path';
+import { parseBftStamps } from './bft.ts';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -68,6 +69,23 @@ export interface InferredFrontmatter {
   date?: string;
   source?: string;
   tags?: string[];
+  /**
+   * House fork (TASK-199): BFT stamp fields, emitted only when the content
+   * carries a parseable house stamp / block height / fleet task id. All
+   * plain YAML scalars/arrays (data-only frontmatter at 0.50).
+   */
+  /** First stamp, or the height-derived one when a height rides/stands alone. */
+  bft?: string;
+  /** Max block height seen anywhere in the content. */
+  block_height?: number;
+  /** Where `bft` came from: a riding/bare height, or a bare stamp. */
+  bft_source?: 'height' | 'stamp';
+  /** True when a stamp disagreed with its riding height (height won). */
+  bft_conflict?: boolean;
+  /** ISO-8601 UTC wall-clock, only when one rides the stamp (Desk form). */
+  bft_utc?: string;
+  /** Sorted unique fleet task ids, normalized T-NNN / K-NN / H-NN / S-NN. */
+  task_ids?: string[];
   /** True if the file already has frontmatter (inference skipped). */
   skipped?: boolean;
   /** The rule that matched, for debugging. */
@@ -326,13 +344,68 @@ export function inferFrontmatter(relativePath: string, content: string): Inferre
     }
   }
 
+  // House fork (TASK-199): BFT stamps + fleet task ids. A UTC date is
+  // emitted ONLY when a wall-clock rides the stamp (the Desk form) — there
+  // is never a height → Gregorian conversion (derive-or-dash).
+  const bftFields = inferBftFields(content);
+  if (bftFields.bft_utc !== undefined) {
+    date = bftFields.bft_utc;
+  }
+
   return {
     title,
     type: matchedRule.type,
     date,
     source: matchedRule.source,
     tags: tags.length > 0 ? tags : undefined,
+    ...bftFields,
     matchedRule: matchedRule.pathPrefix || '(default)',
+  };
+}
+
+/**
+ * House fork (TASK-199): pick the BFT frontmatter fields out of raw content.
+ * The height wins over a remembered stamp (conflict recorded, never silently
+ * corrected); a bare stamp stands on its own. Pure content scan — unlike
+ * inferFrontmatter this does NOT skip frontmatter-bearing files, which is
+ * exactly what the import-time DB-only merge for "pages whose frontmatter
+ * lacks `bft`" needs (the import-file.ts seam recorded in the lane SUMMARY).
+ */
+export function inferBftFields(content: string): Pick<
+  InferredFrontmatter,
+  'bft' | 'block_height' | 'bft_source' | 'bft_conflict' | 'bft_utc' | 'task_ids'
+> {
+  let bft: string | undefined;
+  let blockHeight: number | undefined;
+  let bftSource: 'height' | 'stamp' | undefined;
+  let bftConflict: boolean | undefined;
+  let bftUtc: string | undefined;
+  let taskIds: string[] | undefined;
+  const bftParsed = parseBftStamps(content);
+  if (bftParsed.stamps.length > 0) {
+    const withHeight = bftParsed.stamps.filter(s => s.blockHeight !== undefined);
+    if (withHeight.length > 0) {
+      blockHeight = Math.max(...withHeight.map(s => s.blockHeight!));
+      const chosen = withHeight.find(s => s.blockHeight === blockHeight)!;
+      bft = chosen.bft;
+      bftSource = 'height';
+      if (chosen.conflict === true) bftConflict = true;
+    } else {
+      bft = bftParsed.stamps[0].bft;
+      bftSource = 'stamp';
+    }
+    bftUtc = bftParsed.stamps.find(s => s.utc)?.utc;
+  }
+  if (bftParsed.taskIds.length > 0) {
+    taskIds = bftParsed.taskIds;
+  }
+  return {
+    bft,
+    block_height: blockHeight,
+    bft_source: bftSource,
+    bft_conflict: bftConflict,
+    bft_utc: bftUtc,
+    task_ids: taskIds,
   };
 }
 
@@ -384,6 +457,31 @@ export function serializeFrontmatter(fm: InferredFrontmatter): string {
 
   if (fm.date) {
     lines.push(`date: "${fm.date}"`);
+  }
+
+  // House fork (TASK-199): BFT fields. Every value is a plain YAML
+  // scalar/array — `bft`/`bft_utc` carry non-ASCII or digit-leading text so
+  // they are quoted (JSON.stringify is YAML-safe double-quoting);
+  // `block_height` is a bare integer; `bft_source` is an alpha literal;
+  // `bft_conflict` emits only when true; `task_ids` follows the tags
+  // single-quote flow convention (ids are alnum+dash, never apostrophes).
+  if (fm.bft) {
+    lines.push(`bft: ${JSON.stringify(fm.bft)}`);
+  }
+  if (fm.block_height !== undefined) {
+    lines.push(`block_height: ${fm.block_height}`);
+  }
+  if (fm.bft_source) {
+    lines.push(`bft_source: ${fm.bft_source}`);
+  }
+  if (fm.bft_conflict === true) {
+    lines.push('bft_conflict: true');
+  }
+  if (fm.bft_utc) {
+    lines.push(`bft_utc: ${JSON.stringify(fm.bft_utc)}`);
+  }
+  if (fm.task_ids && fm.task_ids.length > 0) {
+    lines.push(`task_ids: [${fm.task_ids.map(t => `'${t}'`).join(', ')}]`);
   }
 
   if (fm.source) {

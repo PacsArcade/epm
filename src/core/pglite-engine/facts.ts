@@ -710,6 +710,7 @@ interface FactRowSqlShape {
   consolidated_into: number | null;
   source: string;
   source_session: string | null;
+  source_markdown_slug: string | null;
   confidence: number;
   embedding: string | number[] | Float32Array | null;
   embedded_at: Date | string | null;
@@ -754,6 +755,7 @@ function rowToFact(row: FactRowSqlShape): FactRow {
     consolidated_into: row.consolidated_into == null ? null : Number(row.consolidated_into),
     source: row.source,
     source_session: row.source_session,
+    source_markdown_slug: row.source_markdown_slug ?? null,
     confidence: Number(row.confidence),
     embedding,
     embedded_at: toDate(row.embedded_at),
