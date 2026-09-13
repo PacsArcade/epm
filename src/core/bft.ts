@@ -91,7 +91,7 @@ export function isValidBft(s: string): boolean {
 
 // ─── Task ids ────────────────────────────────────────────────────────
 
-const TASK_T_RE = /\b(?:TASK|T)-(\d{1,4})\b/gi;
+const TASK_T_RE = /\b(?:TASK-?|T-?)(\d{1,4})\b/gi;
 const TASK_FLEET_RE = /\b([KHS])-?(\d{1,2})\b/g;
 
 function normalizeTaskMatch(prefix: string, digits: string): string {
