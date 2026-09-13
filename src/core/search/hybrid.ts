@@ -1357,6 +1357,12 @@ export async function hybridSearch(
     // durations + end-of-day for plain-date `until`) at this single seam.
     afterDate: resolveDateBoundary(opts?.since ?? opts?.afterDate, 'since'),
     beforeDate: resolveDateBoundary(opts?.until ?? opts?.beforeDate, 'until'),
+    // House fork (TASK-199): BFT / task-id filters. Same explicit-pick
+    // discipline as the source scoping below — dropping these here would
+    // silently drop the caller's filter on the hybrid hot path.
+    taskId: opts?.taskId,
+    sinceBlock: opts?.sinceBlock,
+    untilBlock: opts?.untilBlock,
     // v0.34.1 (#861, D9 — P0 leak seal): thread source-scoping through so the
     // inner engine.searchKeyword / engine.searchVector calls apply the
     // WHERE source_id filter at SQL level. Pre-fix, this explicit pick
@@ -2720,6 +2726,11 @@ export async function hybridSearchCached(
   // now-relative timestamp, which a persisted cache row can't express.
   const dateFiltered =
     Boolean(opts?.since ?? opts?.afterDate) || Boolean(opts?.until ?? opts?.beforeDate);
+  // House fork (TASK-199): BFT/task-filtered requests skip the cache for the
+  // same reason — taskId/sinceBlock/untilBlock are not part of knobsHash, so
+  // a filtered result set could be served to an unfiltered lookup.
+  const bftFiltered =
+    Boolean(opts?.taskId) || opts?.sinceBlock !== undefined || opts?.untilBlock !== undefined;
   // #3985: type-filtered requests skip the cache — `types` is not part of
   // knobsHash, so a filtered result set could be served to an unfiltered
   // lookup (and vice versa). Mirrors the #3442 date-filter bypass.
@@ -2754,6 +2765,7 @@ export async function hybridSearchCached(
     isNonDefaultColumn ||
     opts?.dedupOpts !== undefined ||
     dateFiltered ||
+    bftFiltered ||
     typeFiltered ||
     pagedRequest;
 

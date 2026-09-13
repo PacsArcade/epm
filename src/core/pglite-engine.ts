@@ -1,7 +1,7 @@
 import { GRANT_COLUMNS_SQL } from './grants/schema.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
-import { readRelationalFanout, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
+import { readRelationalFanout, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores, readBftMeta } from './search/read-enrichment.ts';
 import { PGlite } from '@electric-sql/pglite';
 import type { Transaction } from '@electric-sql/pglite';
 // Engine-live path: static top-level imports (scratch probe, #2674) — the
@@ -97,7 +97,7 @@ import { sanitizeForJsonb, sanitizeText, buildLinkRows, buildTimelineRows } from
 import { PAGE_SORT_SQL, MIN_ENTITY_PAGES_FOR_COVERAGE } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery, buildBftTaskFilter } from './search/sql-ranking.ts';
 import { privatePagesFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateProvenanceFilterFragment } from './search/private-visibility.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
@@ -2470,6 +2470,9 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in postgres-engine).
+    extraFilter += buildBftTaskFilter('p', opts, params);
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Array wins over scalar.
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
@@ -2596,6 +2599,9 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in postgres-engine).
+    extraFilter += buildBftTaskFilter('p', opts, params);
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
       extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
@@ -2760,6 +2766,9 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in postgres-engine).
+    extraFilter += buildBftTaskFilter('p', opts, params);
     // v0.34.1 (#861 — P0 leak seal): source-isolation for the chunk-grain
     // anchor primitive. Layer 7 two-pass walks from these anchors so a
     // foreign-source anchor would let the walk leak into foreign neighbors.
@@ -2874,6 +2883,9 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in postgres-engine).
+    extraFilter += buildBftTaskFilter('p', opts, params);
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // so HNSW candidate pool narrows before re-rank. Mirrors postgres-engine
     // placement decision (codex flagged this during plan review).
@@ -4428,6 +4440,12 @@ export class PGLiteEngine implements BrainEngine {
 
   async getEffectiveDates(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, Date>> {
     return readEffectiveDates(this.executeRaw.bind(this), refs, opts);
+  }
+
+  // House fork (TASK-199): batched BFT frontmatter read (shared impl,
+  // parity twin of postgres-engine).
+  async getBftMetaByRefs(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, { blockHeight: number | null; taskIds: string[] }>> {
+    return readBftMeta(this.executeRaw.bind(this), refs, opts);
   }
 
   async getSalienceScores(refs: Array<{slug: string; source_id: string}>, opts?: PageReadPolicy): Promise<Map<string, number>> {

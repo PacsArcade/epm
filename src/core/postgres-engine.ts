@@ -1,6 +1,6 @@
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
-import { readRelationalFanout, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
+import { readRelationalFanout, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores, readBftMeta } from './search/read-enrichment.ts';
 import postgres from 'postgres';
 import type {
   BrainEngine,
@@ -87,7 +87,7 @@ import { logConnectionEvent } from './connection-audit.ts';
 import { drainBackgroundWorkBeforeDisconnect } from './background-work.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery, buildBftTaskFilter } from './search/sql-ranking.ts';
 import { privatePagesFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateProvenanceFilterFragment } from './search/private-visibility.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
@@ -1494,6 +1494,9 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in pglite-engine).
+    const bftTaskClause = buildBftTaskFilter('p', opts, params);
     // v0.34.1 (#861 — P0 leak seal): source-isolation filter. When the
     // caller's auth scope is set, narrow the inner CTE candidate set so
     // an authenticated MCP client cannot see foreign-source pages via
@@ -1549,6 +1552,7 @@ export class PostgresEngine implements BrainEngine {
           ${symbolKindClause}
           ${afterDateClause}
           ${beforeDateClause}
+          ${bftTaskClause}
           ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
@@ -1669,6 +1673,9 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in pglite-engine).
+    const bftTaskClause = buildBftTaskFilter('p', opts, params);
     let sourceClause = '';
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
@@ -1719,6 +1726,7 @@ export class PostgresEngine implements BrainEngine {
         ${excludeSlugsClause}
         ${afterDateClause}
         ${beforeDateClause}
+        ${bftTaskClause}
         ${sourceClause}
         ${hardExcludeClause}
         ${visibilityClause}
@@ -1834,6 +1842,9 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in pglite-engine).
+    const bftTaskClause = buildBftTaskFilter('p', opts, params);
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Anchor primitive
     // for two-pass retrieval, so cross-source anchors would let the walk
     // discover foreign-source neighbors. Filter at chunk-rank time.
@@ -1879,6 +1890,7 @@ export class PostgresEngine implements BrainEngine {
         ${symbolKindClause}
         ${afterDateClause}
         ${beforeDateClause}
+        ${bftTaskClause}
         ${sourceClause}
         ${hardExcludeClause}
         ${visibilityClause}
@@ -2008,6 +2020,9 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // House fork (TASK-199): BFT / task-id filters — shared builder
+    // (engine-parity law: identical SQL in pglite-engine).
+    const bftTaskClause = buildBftTaskFilter('p', opts, params);
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // specifically. Pushing the filter inside narrows the HNSW candidate set
     // before re-rank; pushing it to the outer SELECT would force HNSW to
@@ -2073,6 +2088,7 @@ export class PostgresEngine implements BrainEngine {
           ${symbolKindClause}
           ${afterDateClause}
           ${beforeDateClause}
+          ${bftTaskClause}
           ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
@@ -3667,6 +3683,12 @@ export class PostgresEngine implements BrainEngine {
 
   async getEffectiveDates(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, Date>> {
     return readEffectiveDates(this.executeRaw.bind(this), refs, opts);
+  }
+
+  // House fork (TASK-199): batched BFT frontmatter read (shared impl,
+  // parity twin of pglite-engine).
+  async getBftMetaByRefs(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, { blockHeight: number | null; taskIds: string[] }>> {
+    return readBftMeta(this.executeRaw.bind(this), refs, opts);
   }
 
   async getSalienceScores(refs: Array<{slug: string; source_id: string}>, opts?: PageReadPolicy): Promise<Map<string, number>> {

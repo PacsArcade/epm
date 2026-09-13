@@ -524,6 +524,14 @@ export interface FactRow {
   consolidated_into: number | null;
   source: string;
   source_session: string | null;
+  /**
+   * House fork (TASK-199): the slug of the markdown page this fact was
+   * extracted from (facts.source_markdown_slug column; NULL for DB-only
+   * facts). Surfaced so `gbrain recall --task/--since-block/--until-block`
+   * can post-filter facts by their source page's BFT frontmatter. Selected
+   * by `SELECT *` in both engines; previously dropped by the row mapper.
+   */
+  source_markdown_slug?: string | null;
   confidence: number;
   embedding: Float32Array | null;
   embedded_at: Date | null;
@@ -1617,6 +1625,18 @@ export interface BrainEngine {
    * with no row; map omits them.
    */
   getEffectiveDates(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, Date>>;
+  /**
+   * House fork (TASK-199): for a list of (slug, source_id) refs, return the
+   * page's BFT frontmatter markers (`block_height` as number-or-null,
+   * `task_ids` as string[]) per ref. Single SQL query, composite-keyed map
+   * (`${source_id}::${slug}`), pages carrying neither marker omitted —
+   * same contract shape as getEffectiveDates. Shared implementation in
+   * search/read-enrichment.ts (readBftMeta) so the engines cannot drift.
+   */
+  getBftMetaByRefs(
+    refs: Array<{slug: string; source_id: string}>,
+    opts?: PageReadScope,
+  ): Promise<Map<string, { blockHeight: number | null; taskIds: string[] }>>;
   /**
    * v0.29.1: for a list of (slug, source_id) refs, return the salience score
    * (emotional_weight × 5 + ln(1 + take_count)) per ref. Single SQL query.

@@ -9,6 +9,9 @@
  *   gbrain recall --session <id>            # listFactsBySession
  *   gbrain recall --today                   # markdown render with kind icons
  *   gbrain recall --grep <text>             # text filter (case-insensitive)
+ *   gbrain recall --task T-196              # facts whose source page carries the task id (house fork, TASK-199)
+ *   gbrain recall --since-block 966000      # facts whose source page's block_height >= N (house fork)
+ *   gbrain recall --until-block 967000      #   ... <= N; local brain only, after-LIMIT like --grep
  *   gbrain recall --supersessions [--since DUR]   # audit log
  *   gbrain recall --include-expired
  *   gbrain recall --as-context              # prompt-injection-ready markdown
@@ -37,6 +40,7 @@ import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { readCursor, writeCursor } from '../core/recall-cursor-state.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
+import { normalizeTaskId } from '../core/bft.ts';
 
 // Same kebab-case shape gate the source-resolver applies. v0.32: applied
 // locally on thin-client where the canonical resolver's assertSourceExists
@@ -71,6 +75,15 @@ interface ParsedFlags {
   // (this hand-rolled CLI otherwise ignores unknown flags silently).
   query: string | null;
   budgetTokens: number | null;
+  // House fork (TASK-199): BFT / task-id filters. Parsed EXPLICITLY (this
+  // hand-rolled parser skips unknown flags silently — recall.ts:137 — so an
+  // unlisted flag would be dropped without a sound; these are honored or
+  // the run refuses). Post-filters facts via their source page's BFT
+  // frontmatter (facts.source_markdown_slug → pages.frontmatter), same
+  // after-LIMIT semantics as --grep.
+  task: string | null;
+  sinceBlock: number | null;
+  untilBlock: number | null;
   // v0.32
   sinceLastRun: boolean;
   pending: boolean;
@@ -101,6 +114,9 @@ function parseFlags(args: string[]): ParsedFlags {
     limit: 50,
     query: null,
     budgetTokens: null,
+    task: null,
+    sinceBlock: null,
+    untilBlock: null,
     sinceLastRun: false,
     pending: false,
     rollup: false,
@@ -112,6 +128,9 @@ function parseFlags(args: string[]): ParsedFlags {
     if (a === '--since') { out.since = parseSinceParam(args[++i] ?? ''); continue; }
     if (a === '--session' || a === '--session-id') { out.sessionId = args[++i] ?? null; continue; }
     if (a === '--grep') { out.grep = (args[++i] ?? '').toLowerCase(); continue; }
+    if (a === '--task') { out.task = args[++i] ?? ''; continue; }
+    if (a === '--since-block') { out.sinceBlock = parseBlockParam(args[++i] ?? '', '--since-block'); continue; }
+    if (a === '--until-block') { out.untilBlock = parseBlockParam(args[++i] ?? '', '--until-block'); continue; }
     if (a === '--today') { out.today = true; continue; }
     if (a === '--supersessions') { out.supersessions = true; continue; }
     if (a === '--include-expired') { out.includeExpired = true; continue; }
@@ -164,6 +183,19 @@ function parseSinceParam(raw: string): Date | null {
   return null;
 }
 
+/**
+ * House fork (TASK-199): block-height flag values are validated LOUDLY at
+ * parse time — a malformed height exits 2 here rather than being silently
+ * dropped by the hand-rolled parser's unknown-flag skip.
+ */
+function parseBlockParam(raw: string, flag: string): number {
+  if (!/^\d+$/.test(raw)) {
+    process.stderr.write(`Error: ${flag} must be a non-negative integer block height (got "${raw}").\n`);
+    process.exit(2);
+  }
+  return parseInt(raw, 10);
+}
+
 function validateAndNormalizeFlags(flags: ParsedFlags): void {
   if (flags.sinceLastRun && flags.since) {
     process.stderr.write('Error: --since-last-run and --since are mutually exclusive.\n');
@@ -186,6 +218,54 @@ function validateAndNormalizeFlags(flags: ParsedFlags): void {
     process.stderr.write(`Error: --source value "${flags.source}" must match [a-z0-9-]{1,32} (kebab-case).\n`);
     process.exit(2);
   }
+  // House fork (TASK-199): normalize --task or refuse — never silently drop.
+  if (flags.task !== null) {
+    const normalized = normalizeTaskId(flags.task);
+    if (!normalized) {
+      process.stderr.write(
+        `Error: --task value "${flags.task}" is not a fleet task id (expected T-196 / TASK-196 / K12 / H71 / S52).\n`,
+      );
+      process.exit(2);
+    }
+    flags.task = normalized;
+  }
+  if (flags.sinceBlock !== null && flags.untilBlock !== null && flags.sinceBlock > flags.untilBlock) {
+    process.stderr.write(`Error: --since-block (${flags.sinceBlock}) must be <= --until-block (${flags.untilBlock}).\n`);
+    process.exit(2);
+  }
+}
+
+/**
+ * House fork (TASK-199): post-filter fact rows by their SOURCE PAGE's BFT
+ * frontmatter (facts.source_markdown_slug → pages.frontmatter block_height
+ * / task_ids) via one batched read. A fact whose source page carries no BFT
+ * marker never matches an active filter — heights are never guessed.
+ * After-LIMIT semantics, exactly like --grep above.
+ */
+async function filterRowsByBftMeta(
+  engine: BrainEngine,
+  rows: FactRow[],
+  flags: ParsedFlags,
+): Promise<FactRow[]> {
+  const refs = new Map<string, { slug: string; source_id: string }>();
+  for (const r of rows) {
+    const slug = r.source_markdown_slug;
+    if (slug && !refs.has(`${r.source_id}::${slug}`)) {
+      refs.set(`${r.source_id}::${slug}`, { slug, source_id: r.source_id });
+    }
+  }
+  if (refs.size === 0) return [];
+  const meta = await engine.getBftMetaByRefs([...refs.values()]);
+  return rows.filter((r) => {
+    const slug = r.source_markdown_slug;
+    if (!slug) return false;
+    const m = meta.get(`${r.source_id}::${slug}`);
+    if (!m) return false;
+    if (flags.task !== null && !m.taskIds.includes(flags.task)) return false;
+    if (flags.sinceBlock !== null && (m.blockHeight === null || m.blockHeight < flags.sinceBlock)) return false;
+    if (flags.untilBlock !== null && (m.blockHeight === null || m.blockHeight > flags.untilBlock)) return false;
+    return true;
+  });
 }
 
 async function resolveSourceForRecall(
@@ -354,6 +434,15 @@ async function runRecallOnce(
   let pendingCount: number | undefined;
 
   if (thinClient) {
+    // House fork (TASK-199): the BFT filters post-filter via a local batched
+    // page read the remote `recall` op cannot express — refuse LOUDLY rather
+    // than silently returning unfiltered rows (recall.ts:137's lesson).
+    if (flags.task !== null || flags.sinceBlock !== null || flags.untilBlock !== null) {
+      process.stderr.write(
+        'Error: --task/--since-block/--until-block require a local brain (not supported in thin-client mode).\n',
+      );
+      process.exit(2);
+    }
     const cfg = loadConfig();
     const params: Record<string, unknown> = {
       limit: flags.limit,
@@ -400,6 +489,12 @@ async function runRecallOnce(
     if (flags.pending) {
       pendingCount = await engine.countUnconsolidatedFacts(sourceId);
     }
+  }
+
+  // House fork (TASK-199): BFT / task-id post-filter (source-page
+  // frontmatter). Runs before --grep so both filters compose.
+  if (flags.task !== null || flags.sinceBlock !== null || flags.untilBlock !== null) {
+    rows = await filterRowsByBftMeta(engine, rows, flags);
   }
 
   if (flags.grep) {

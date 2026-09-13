@@ -630,6 +630,7 @@ interface FactRowSqlShape {
   consolidated_into: number | bigint | null;
   source: string;
   source_session: string | null;
+  source_markdown_slug: string | null;
   confidence: number | string;
   embedding: string | number[] | Float32Array | null;
   embedded_at: Date | null;
@@ -669,6 +670,7 @@ function rowToFactPg(row: FactRowSqlShape): FactRow {
     consolidated_into: row.consolidated_into == null ? null : Number(row.consolidated_into),
     source: row.source,
     source_session: row.source_session,
+    source_markdown_slug: row.source_markdown_slug ?? null,
     confidence: typeof row.confidence === 'string' ? parseFloat(row.confidence) : row.confidence,
     embedding,
     embedded_at: row.embedded_at,

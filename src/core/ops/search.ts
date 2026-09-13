@@ -27,6 +27,8 @@ import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
+import { normalizeTaskId } from '../bft.ts';
+import type { SearchResult } from '../types.ts';
 import {
   assertExplicitSourceLive,
   federatedSearchScope,
@@ -52,6 +54,69 @@ async function resolveEffectiveLimit(ctx: OperationContext, p: Record<string, un
   const modeInput = await loadSearchModeConfig(ctx.engine);
   const resolved = resolveSearchMode({ mode: perCallMode ?? modeInput.mode, overrides: modeInput.overrides });
   return (p.limit as number) || resolved.searchLimit;
+}
+
+// --- House fork (TASK-199): BFT / task-id filter plumbing ---
+
+/**
+ * Normalize the `task` param to the house form (T-NNN / K-NN / H-NN /
+ * S-NN). Invalid input is REJECTED with invalid_params — a filter that
+ * can't be honored must never silently drop (the recall.ts:137 lesson).
+ */
+function normalizeTaskParam(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const normalized = typeof raw === 'string' ? normalizeTaskId(raw) : null;
+  if (!normalized) {
+    throw new OperationError(
+      'invalid_params',
+      `query: invalid task id ${JSON.stringify(raw)} — expected a fleet task id (T-196, TASK-196, K12, H71, S52).`,
+      'Pass --task T-196 (also accepts task-196, K12, H71, S52; normalized before filtering).',
+    );
+  }
+  return normalized;
+}
+
+/** Validate a block-height param: non-negative integer, or invalid_params. */
+function parseBlockParam(raw: unknown, name: string): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const n = typeof raw === 'number' ? raw : NaN;
+  if (!Number.isInteger(n) || n < 0) {
+    throw new OperationError(
+      'invalid_params',
+      `query: ${name} must be a non-negative integer block height (got ${JSON.stringify(raw)}).`,
+      'Pass a real block height, e.g. --since-block 966000.',
+    );
+  }
+  return n;
+}
+
+/**
+ * Stamp `SearchResult.block_height` from the batched getBftMetaByRefs read
+ * (the stampContentFlags precedent — bounded by the returned set, fail-open)
+ * and tie-break newest-block-first among equal scores. Array.prototype.sort
+ * is stable, so non-tied rows keep their fusion order exactly.
+ */
+async function stampBlockHeightsAndTieBreak(ctx: OperationContext, results: SearchResult[]): Promise<void> {
+  try {
+    const seen = new Map<string, { slug: string; source_id: string }>();
+    for (const r of results) {
+      if (r.slug && r.source_id && !seen.has(`${r.source_id}::${r.slug}`)) {
+        seen.set(`${r.source_id}::${r.slug}`, { slug: r.slug, source_id: r.source_id });
+      }
+    }
+    if (seen.size === 0) return;
+    const meta = await ctx.engine.getBftMetaByRefs([...seen.values()]);
+    if (meta.size === 0) return;
+    for (const r of results) {
+      const m = meta.get(`${r.source_id}::${r.slug}`);
+      if (m?.blockHeight != null) r.block_height = m.blockHeight;
+    }
+    if (results.some((r) => r.block_height !== undefined)) {
+      results.sort((a, b) => (b.score - a.score) || ((b.block_height ?? -1) - (a.block_height ?? -1)));
+    }
+  } catch {
+    // best-effort: a meta-fetch failure must not break retrieval.
+  }
 }
 
 // --- Search ---
@@ -353,6 +418,21 @@ const query: Operation = {
       description:
         "v0.29.1 — filter to effective_date <= this. Same format as `since`. Replaces deprecated `beforeDate`. YYYY-MM-DD lands at end-of-day.",
     },
+    task: {
+      type: 'string',
+      description:
+        "House fork (TASK-199) — filter to pages whose frontmatter `task_ids` contains this fleet task id. Accepts T-196 / TASK-196 / task-196 / K12 / H71 / S52 (normalized to T-NNN / K-NN / H-NN / S-NN). Invalid ids are rejected with invalid_params, never silently dropped.",
+    },
+    since_block: {
+      type: 'number',
+      description:
+        "House fork (TASK-199) — filter to pages whose frontmatter `block_height` is >= this Bitcoin block height. Pages without a BFT stamp never match (heights are never guessed for unstamped pages).",
+    },
+    until_block: {
+      type: 'number',
+      description:
+        "House fork (TASK-199) — filter to frontmatter `block_height` <= this height. Same shape as `since_block`.",
+    },
     source_id: {
       type: 'string',
       description:
@@ -426,6 +506,19 @@ const query: Operation = {
     // #4352 — same enforcement for the full-control query op (both the image
     // searchVector branch and the text hybrid path below).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+    // House fork (TASK-199): normalize/validate the BFT filters up front —
+    // invalid input is rejected, never silently dropped. Threaded into both
+    // the image branch and the text hybrid path below.
+    const taskId = normalizeTaskParam(p.task);
+    const sinceBlock = parseBlockParam(p.since_block, 'since_block');
+    const untilBlock = parseBlockParam(p.until_block, 'until_block');
+    if (sinceBlock !== undefined && untilBlock !== undefined && sinceBlock > untilBlock) {
+      throw new OperationError(
+        'invalid_params',
+        `query: since_block (${sinceBlock}) must be <= until_block (${untilBlock}).`,
+        'Swap the bounds or widen the window.',
+      );
+    }
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -451,6 +544,9 @@ const query: Operation = {
         requireSafeChunks: ctx.remote !== false,
         takesHoldersAllowList: readHolders(ctx),
         ...(types ? { types } : {}),
+        ...(taskId ? { taskId } : {}),
+        ...(sinceBlock !== undefined ? { sinceBlock } : {}),
+        ...(untilBlock !== undefined ? { untilBlock } : {}),
         ...querySourceScope,
       });
       return applySnippetCap(results, snippetCap);
@@ -511,6 +607,10 @@ const query: Operation = {
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,
       since: typeof p.since === 'string' ? p.since : undefined,
       until: typeof p.until === 'string' ? p.until : undefined,
+      // House fork (TASK-199): BFT / task-id filters (validated above).
+      taskId,
+      sinceBlock,
+      untilBlock,
       // v0.32.x search-lite: token budget + cache opt-outs.
       tokenBudget: typeof p.token_budget === 'number' ? (p.token_budget as number) : undefined,
       useCache: typeof p.use_cache === 'boolean' ? (p.use_cache as boolean) : undefined,
@@ -604,6 +704,12 @@ const query: Operation = {
             ...querySourceScope,
             since: typeof p.since === 'string' ? p.since : undefined,
             until: typeof p.until === 'string' ? p.until : undefined,
+            // House fork (TASK-199): preserve the caller's BFT filters on the
+            // escalated re-run — an escalation that drops them must not
+            // replace correctly-filtered weak results.
+            taskId,
+            sinceBlock,
+            untilBlock,
             crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
             embeddingColumn: embeddingColumnParam,
             onMeta: (m) => { escalatedMeta = m; },
@@ -659,6 +765,10 @@ const query: Operation = {
         }
       }
     }
+    // House fork (TASK-199): stamp block_height + newest-block-first
+    // tie-break on the FINAL set (bounded by limit), before capture/meta so
+    // every downstream consumer sees the tie-broken order.
+    await stampBlockHeightsAndTieBreak(ctx, results);
     const latency_ms = Date.now() - startedAt;
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the

@@ -186,6 +186,7 @@ export interface Page {
 }
 
 export type EffectiveDateSource =
+  | 'bft_utc'
   | 'event_date'
   | 'date'
   | 'published'
@@ -805,6 +806,14 @@ export interface SearchResult {
    */
   content_flag?: { reason: string; detail: string };
   /**
+   * House fork (TASK-199): the page's frontmatter `block_height` when it
+   * carries one. Stamped post-fusion by the query op from the batched
+   * getBftMetaByRefs read (the stampContentFlags precedent) and used as the
+   * newest-block-first tie-break when scores are equal. Absent on pages
+   * with no BFT stamp.
+   */
+  block_height?: number;
+  /**
    * 2026-09 fix wave (#3617 follow-up): true when this row came from the
    * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
    * strict websearch match. Stamped by the ENGINES inside the fallback
@@ -1262,6 +1271,25 @@ export interface SearchOpts extends PageReadPolicy {
    * Boundary semantics: end-of-day for plain YYYY-MM-DD.
    */
   until?: string;
+  /**
+   * House fork (TASK-199): filter to pages whose frontmatter `task_ids`
+   * contains this normalized fleet task id (T-NNN / K-NN / H-NN / S-NN).
+   * JSONB `?` predicate on `frontmatter->'task_ids'` in BOTH engines
+   * (engine-parity law); callers normalize via bft.ts normalizeTaskId and
+   * reject invalid input before it reaches the engine.
+   */
+  taskId?: string;
+  /**
+   * House fork (TASK-199): filter to pages whose frontmatter `block_height`
+   * is >= this Bitcoin block height. Pages without a block_height never
+   * match (the filter selects stamped pages, it does not guess heights for
+   * unstamped ones — derive-or-dash).
+   */
+  sinceBlock?: number;
+  /**
+   * House fork (TASK-199): same shape as `sinceBlock`, upper bound.
+   */
+  untilBlock?: number;
   /**
    * v0.32.x (search-lite): cap the cumulative token cost of returned results.
    * Applied AFTER all scoring, ranking, dedup, and boosts — the budget is the

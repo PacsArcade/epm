@@ -140,6 +140,49 @@ export async function readEffectiveDates(query: ReadQuery, refs: PageRef[], scop
   return new Map(rows.map(row => [`${row.source_id}::${row.slug}`, row.ts instanceof Date ? row.ts : new Date(row.ts)]));
 }
 
+/**
+ * House fork (TASK-199): batched read of the BFT frontmatter markers
+ * (`block_height`, `task_ids`) for a set of (slug, source_id) refs. Single
+ * SQL query, not N+1; composite-keyed map (`${source_id}::${slug}`) exactly
+ * like readEffectiveDates. Shared by both engines (parity by construction).
+ * Consumers: the query op's block_height stamp + newest-block-first
+ * tie-break, and `gbrain recall --task/--since-block/--until-block`
+ * post-filtering. Pages carrying neither marker get no entry.
+ *
+ * `task_ids` comes back as a JS array on postgres.js and as JSON text on
+ * PGLite — both shapes are parsed here (reading JSON out of JSONB, never
+ * stringifying in). A non-numeric hand-authored block_height yields
+ * blockHeight: null rather than a throw.
+ */
+export async function readBftMeta(
+  query: ReadQuery,
+  refs: PageRef[],
+  scope?: PageReadScope,
+): Promise<Map<string, { blockHeight: number | null; taskIds: string[] }>> {
+  if (!refs.length) return new Map();
+  const params: unknown[] = [refs.map(r => r.slug), refs.map(r => r.source_id)];
+  const filter = pageReadFilter('p', scope, params, !!scope);
+  const rows = await query<{ slug: string; source_id: string; block_height: string | null; task_ids: unknown }>(`
+    SELECT p.slug, p.source_id,
+      p.frontmatter->>'block_height' AS block_height,
+      p.frontmatter->'task_ids' AS task_ids
+    FROM pages p JOIN unnest($1::text[], $2::text[]) AS u(slug, source_id)
+      ON p.slug = u.slug AND p.source_id = u.source_id
+    WHERE (p.frontmatter ? 'block_height' OR p.frontmatter ? 'task_ids') AND ${filter}`, params);
+  const out = new Map<string, { blockHeight: number | null; taskIds: string[] }>();
+  for (const row of rows) {
+    const bh = row.block_height !== null && /^\d+$/.test(String(row.block_height))
+      ? parseInt(String(row.block_height), 10)
+      : null;
+    let taskIds: string[] = [];
+    const raw = row.task_ids;
+    const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(arr)) taskIds = arr.filter((t): t is string => typeof t === 'string');
+    out.set(`${row.source_id}::${row.slug}`, { blockHeight: bh, taskIds });
+  }
+  return out;
+}
+
 export async function readSalienceScores(query: ReadQuery, refs: PageRef[], scope?: PageReadPolicy): Promise<Map<string, number>> {
   if (!refs.length) return new Map();
   const params: unknown[] = [refs.map(r => r.slug), refs.map(r => r.source_id)];
