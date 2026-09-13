@@ -344,10 +344,37 @@ export function inferFrontmatter(relativePath: string, content: string): Inferre
     }
   }
 
-  // House fork (TASK-199): BFT stamps + fleet task ids. The height wins
-  // over a remembered stamp; a bare stamp stands on its own; a UTC date is
+  // House fork (TASK-199): BFT stamps + fleet task ids. A UTC date is
   // emitted ONLY when a wall-clock rides the stamp (the Desk form) — there
   // is never a height → Gregorian conversion (derive-or-dash).
+  const bftFields = inferBftFields(content);
+  if (bftFields.bft_utc !== undefined) {
+    date = bftFields.bft_utc;
+  }
+
+  return {
+    title,
+    type: matchedRule.type,
+    date,
+    source: matchedRule.source,
+    tags: tags.length > 0 ? tags : undefined,
+    ...bftFields,
+    matchedRule: matchedRule.pathPrefix || '(default)',
+  };
+}
+
+/**
+ * House fork (TASK-199): pick the BFT frontmatter fields out of raw content.
+ * The height wins over a remembered stamp (conflict recorded, never silently
+ * corrected); a bare stamp stands on its own. Pure content scan — unlike
+ * inferFrontmatter this does NOT skip frontmatter-bearing files, which is
+ * exactly what the import-time DB-only merge for "pages whose frontmatter
+ * lacks `bft`" needs (the import-file.ts seam recorded in the lane SUMMARY).
+ */
+export function inferBftFields(content: string): Pick<
+  InferredFrontmatter,
+  'bft' | 'block_height' | 'bft_source' | 'bft_conflict' | 'bft_utc' | 'task_ids'
+> {
   let bft: string | undefined;
   let blockHeight: number | undefined;
   let bftSource: 'height' | 'stamp' | undefined;
@@ -367,29 +394,18 @@ export function inferFrontmatter(relativePath: string, content: string): Inferre
       bft = bftParsed.stamps[0].bft;
       bftSource = 'stamp';
     }
-    const utc = bftParsed.stamps.find(s => s.utc)?.utc;
-    if (utc) {
-      bftUtc = utc;
-      date = utc;
-    }
+    bftUtc = bftParsed.stamps.find(s => s.utc)?.utc;
   }
   if (bftParsed.taskIds.length > 0) {
     taskIds = bftParsed.taskIds;
   }
-
   return {
-    title,
-    type: matchedRule.type,
-    date,
-    source: matchedRule.source,
-    tags: tags.length > 0 ? tags : undefined,
     bft,
     block_height: blockHeight,
     bft_source: bftSource,
     bft_conflict: bftConflict,
     bft_utc: bftUtc,
     task_ids: taskIds,
-    matchedRule: matchedRule.pathPrefix || '(default)',
   };
 }
 
