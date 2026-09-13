@@ -65,7 +65,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'addLink', 'addLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
   'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
-  'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
+  'getPageTimestamps', 'getEffectiveDates', 'getBftMetaByRefs', 'getSalienceScores', 'findOrphanPages',
   // Tags
   'addTag', 'removeTag', 'getTags',
   // Timeline + chronicle
