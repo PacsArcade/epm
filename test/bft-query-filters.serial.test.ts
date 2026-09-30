@@ -12,6 +12,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { hybridSearch } from '../src/core/search/hybrid.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 
@@ -50,7 +51,8 @@ async function seed(engine: PGLiteEngine) {
       : slug === PAGE_K12 ? 'Widget ledger notes from the earlier watch.'
       : slug === PAGE_PLAIN ? 'Widget ledger notes with no stamps at all.'
       : 'Widget ledger notes with a hand-authored broken height.';
-    await engine.upsertChunks(slug, [{ chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth' }]);
+    // v0.60 search reads only safe-fence chunks; the upstream helper marks them.
+    await installFixtureChunks(engine, slug, [{ chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth' }]);
   }
 }
 

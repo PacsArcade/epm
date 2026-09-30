@@ -52,6 +52,7 @@ import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, LockStolenError, type DbLockHandle } from './db-lock.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
+import { assertEmbedNotStalled } from './embed-stall.ts';
 
 export { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 
@@ -1273,6 +1274,7 @@ async function runPhaseSync(
       noExtract: willRunExtractPhase,      // dedupe ONLY when cycle's extract phase will also run.
                                            // If extract isn't scheduled (e.g. `gbrain dream --phase sync`),
                                            // sync's inline extract still runs to preserve prior behavior.
+      explicitProcessing: [],              // unattended: an unfinished managed cursor keeps its own options (#5632)
     });
     const syncedCount = result.added + result.modified;
     // #3068: a pull_failed partial means the internal git pull failed and the
@@ -1355,21 +1357,11 @@ async function runPhaseExtract(
 ): Promise<PhaseResult> {
   try {
     const { runExtractCore } = await import('../commands/extract.ts');
-    const { loadConfig } = await import('./config.ts');
-    // Default off: the incremental cycle extracts body links only unless the
-    // operator opts in to keeping externally-edited frontmatter links fresh too.
-    // Both planes, file wins (env > file > DB precedence, per loadConfigWithEngine):
-    // `gbrain config set autopilot.incremental_extract_include_frontmatter true`
-    // writes the DB plane (engine.setConfig), so a file-plane-only read here
-    // would make the documented enable command a silent no-op (#2120 class).
-    const fileVal = loadConfig()?.autopilot?.incremental_extract_include_frontmatter;
-    let includeFrontmatter = fileVal === true;
-    if (fileVal === undefined) {
-      try {
-        includeFrontmatter =
-          (await engine.getConfig('autopilot.incremental_extract_include_frontmatter')) === 'true';
-      } catch { /* config table unreadable → default off */ }
-    }
+    const { resolveIncludeFrontmatter } = await import('./extract-frontmatter.ts');
+    // Shared resolver (file plane wins, then DB plane, fail-closed) so this
+    // cycle, sync's inline extract, the extract_stale minion and maintain all
+    // answer the same way; `1`/`yes`/`on` now count as true here too.
+    const includeFrontmatter = await resolveIncludeFrontmatter(engine);
     // Extract is read-mostly against the filesystem + write to links table.
     // Honor dryRun by skipping with a 'skipped' entry: extract doesn't have
     // a clean dry-run mode today and runCycle should be honest about it.
@@ -1532,6 +1524,7 @@ async function runPhaseExtractFacts(
         pagesWithFacts: result.pagesWithFacts,
         factsInserted: result.factsInserted,
         factsDeleted: result.factsDeleted,
+        pagesFailed: result.pagesFailed,
         warnings: result.warnings.slice(0, 5),
         // v0.35.5: phantom counters surfaced so extractTotals() can lift
         // them to CycleReport.totals and the daily report makes the
@@ -1633,6 +1626,7 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
     // #394: quiet — the cycle reports embed counts via its own PhaseResult;
     // raw `[dry-run] Would embed ...` stdout lines would corrupt `dream --json`.
     const result = await runEmbedCore(engine, { stale: true, dryRun, signal, quiet: true });
+    assertEmbedNotStalled(result); // #4599: a watchdog-aborted drain is a failed phase, not 'ok'
     const embeddedCount = dryRun ? result.would_embed : result.embedded;
     return {
       phase: 'embed',
@@ -1878,6 +1872,11 @@ export async function runCycle(
   const dryRun = !!opts.dryRun;
   const pull = !!opts.pull;
   const timestamp = new Date().toISOString();
+  // C-15: one calendar date for every dated phase of this cycle (a run that
+  // crosses midnight, or a UTC host, must not split the cycle across days).
+  const cycleDate = engine
+    ? await import('./cycle/cycle-date.ts').then(m => m.resolveCycleDate(engine)).catch(() => undefined)
+    : undefined;
   const phaseResults: PhaseResult[] = excludedPhases.map((phase) => ({
     phase,
     status: 'skipped',
@@ -2109,9 +2108,10 @@ export async function runCycle(
         }) as Promise<T>;
       };
   let lockStolenAbort = false;
-  // Raced variant for the 5 long phases (synthesize / extract_atoms / patterns
-  // / synthesize_concepts / consolidate): even where their opts now carry the
-  // signal (#4077 synthesize/patterns, consolidate), a steal must be able to
+  // Raced variant for the long phases (synthesize / extract_atoms / patterns
+  // / synthesize_concepts / recompute_emotional_weight / consolidate): even
+  // where their opts now carry the signal (#4077 synthesize/patterns,
+  // consolidate, #4797 recompute), a steal must be able to
   // stop the WAIT while the phase unwinds cooperatively; extract_atoms and
   // synthesize_concepts still can't carry one (W6). Steal-free cycles behave
   // byte-identically to timePhase.
@@ -2252,6 +2252,7 @@ export async function runCycle(
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
           inputFile: opts.synthInputFile,
           date: opts.synthDate,
+          cycleDate,
           from: opts.synthFrom,
           to: opts.synthTo,
           bypassDreamGuard: opts.synthBypassDreamGuard,
@@ -2475,6 +2476,7 @@ export async function runCycle(
           // always-undefined — hook, so long phases never refreshed).
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
           once: opts.onceForPhase === 'patterns',
+          cycleDate,
           deadlineAtMs: opts.deadlineAtMs ?? null,
           privateQueueOwnerJobId: opts.privateQueueOwnerJobId ?? null,
           // #1586: scope pattern writes to the cycle's resolved source, same as
@@ -2570,10 +2572,16 @@ export async function runCycle(
                 ...(synthesizeWrittenSlugs ?? []),
               ]))
             : undefined;
-        const { result, duration_ms } = await timePhase(() =>
+        // #4797: raced + signal + lock-refresh + progress, like consolidate —
+        // the full-brain write is sliced inside the phase; these hooks fire
+        // between slices so a long first run stays observable and abortable.
+        const { result, duration_ms } = await racedTimePhase(() =>
           runPhaseRecomputeEmotionalWeight(engine, {
             dryRun,
             affectedSlugs: incremental,
+            signal: cycleSignal,
+            yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
+            onProgress: () => progress.tick(),
           }),
         );
         result.duration_ms = duration_ms;
@@ -2602,6 +2610,7 @@ export async function runCycle(
         const { runPhaseConsolidate } = await import('./cycle/phases/consolidate.ts');
         const { result, duration_ms } = await racedTimePhase(() => runPhaseConsolidate(engine, {
           dryRun,
+          sourceId: cycleSourceId,
           // W0 (Tier-1 #1): wrap the caller hook so this phase ALSO refreshes
           // the cycle lock (pre-fix these sites passed the raw — in production
           // always-undefined — hook, so long phases never refreshed).
@@ -2652,7 +2661,7 @@ export async function runCycle(
           // #4102: `once` bypasses the cycle.propose_takes.enabled off switch
           // for `gbrain dream --phase propose_takes --once` (same semantics as
           // conversation_facts_backfill / enrich_thin above).
-          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: brainDir ?? undefined, deadlineAtMs: opts.deadlineAtMs ?? null, once: opts.onceForPhase === 'propose_takes' }) as Promise<PhaseResult>);
+          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { dryRun, repoPath: brainDir ?? undefined, deadlineAtMs: opts.deadlineAtMs ?? null, once: opts.onceForPhase === 'propose_takes' }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();
@@ -2663,7 +2672,7 @@ export async function runCycle(
           checkAborted(cycleSignal);
           progress.start('cycle.grade_takes');
           const { runPhaseGradeTakes } = await import('./cycle/grade-takes.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, { deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
+          const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, { dryRun, deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();
@@ -2674,7 +2683,7 @@ export async function runCycle(
           checkAborted(cycleSignal);
           progress.start('cycle.calibration_profile');
           const { runPhaseCalibrationProfile } = await import('./cycle/calibration-profile.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, { deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
+          const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, { dryRun, deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();
@@ -2718,6 +2727,7 @@ export async function runCycle(
             dryRun,
             brainDir: brainDir ?? undefined,
             forceEnabled: opts.onceForPhase === 'drift',
+            cycleDate,
           });
           const status: PhaseStatus =
             r.status === 'complete' ? 'ok' :
