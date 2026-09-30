@@ -172,7 +172,8 @@ export async function installSharedBrainBridge(options: {
   const launcher = confinedPath(root, 'gbrain');
   const sourceCli = fileURLToPath(new URL('../../cli.ts', import.meta.url));
   const content = renderAgentLauncher({ root: home, sourceId: source.source_id, bunPath: process.execPath,
-    cliPath: sourceCli.includes('$bunfs') ? undefined : sourceCli });
+    // House fork: compiled binaries resolve '../../cli.ts' to '/cli.ts' (no $bunfs marker).
+    cliPath: import.meta.url.includes('$bunfs') || sourceCli.includes('$bunfs') || !existsSync(sourceCli) ? undefined : sourceCli });
   const actual = existsSync(launcher) ? sha256(readFileSync(launcher)) : null;
   if (actual !== null && ![prior.launcher_hash, prior.pending_hash].includes(actual)) return pending('local_conflict', 'The installation-bound launcher was edited or is unowned. Preserve it before retrying.');
   let registration: LocalRegistration;

@@ -145,10 +145,13 @@ async function installThinClient(c: HarnessCredentials, opts: InstallOptions, co
     const config = { engine: 'postgres', remote_mcp: { issuer_url: c.issuer_url, mcp_url: c.mcp_url,
       oauth_client_id: c.client_id, oauth_client_secret: c.client_secret } };
     const sourceCli = fileURLToPath(new URL('../../cli.ts', import.meta.url));
+    // House fork: in a compiled binary, '../../' climbs out of $bunfs to '/cli.ts',
+    // so the resolved path never carries the marker. Check the module URL and the file.
+    const compiled = import.meta.url.includes('$bunfs') || sourceCli.includes('$bunfs') || !existsSync(sourceCli);
     const launcher = join(root, 'bin', 'gbrain');
     const files = [
       { path: '.gbrain/config.json', text: `${JSON.stringify(config, null, 2)}\n`, mode: 0o600 },
-      { path: 'bin/gbrain', text: renderAgentLauncher({ root, bunPath: process.execPath, cliPath: sourceCli.includes('$bunfs') ? undefined : sourceCli, mode: 'thin-client',
+      { path: 'bin/gbrain', text: renderAgentLauncher({ root, bunPath: process.execPath, cliPath: compiled ? undefined : sourceCli, mode: 'thin-client',
         repairHint: `Reinstall GBrain in this environment, then repeat: gbrain connect ${shellQuote(c.mcp_url)} --harness ${shellQuote(opts.harness)} --credentials-file <private-handoff-file> --root ${shellQuote(root)} --install` }), mode: 0o700 },
       { path: 'GBRAIN-INSTRUCTIONS.md', text: `${GBRAIN_MCP_INSTRUCTIONS}\n\nRun commands with the absolute launcher: ${launcher}\nThis is a hosted connection. The host grant controls sources and permissions.\n`, mode: 0o600 },
     ];
